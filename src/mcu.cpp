@@ -33,8 +33,7 @@
  */
 #include <stdio.h>
 #include <string.h>
-#define SDL_MAIN_HANDLED
-#include "SDL.h"
+
 #include "mcu.h"
 #include "mcu_opcodes.h"
 #include "mcu_interrupt.h"
@@ -42,9 +41,6 @@
 #include "pcm.h"
 #include "lcd.h"
 #include "submcu.h"
-#include "midi.h"
-#include "utf8main.h"
-#include "utils/files.h"
 
 #if __linux__
 #include <unistd.h>
@@ -131,55 +127,14 @@ const char* roms[ROM_SET_COUNT][ROM_SET_N_FILES] =
     "",
 };
 
-int romset = ROM_SET_MK2;
-
-static const int ROM1_SIZE = 0x8000;
-static const int ROM2_SIZE = 0x80000;
-static const int RAM_SIZE = 0x400;
-static const int SRAM_SIZE = 0x8000;
-static const int NVRAM_SIZE = 0x8000; // JV880 only
-static const int CARDRAM_SIZE = 0x8000; // JV880 only
-static const int ROMSM_SIZE = 0x1000;
-
-
-static int audio_buffer_size;
-static int audio_page_size;
-static short *sample_buffer;
-
-static int sample_read_ptr;
-static int sample_write_ptr;
-
-static SDL_AudioDeviceID sdl_audio;
-
-void MCU_ErrorTrap(void)
+void MCU_ErrorTrap(struct sc55_state *st)
 {
-    printf("%.2x %.4x\n", mcu.cp, mcu.pc);
+    printf("%.2x %.4x\n", st->mcu.cp, st->mcu.pc);
 }
 
-int mcu_mk1 = 0; // 0 - SC-55mkII, SC-55ST. 1 - SC-55, CM-300/SCC-1
-int mcu_cm300 = 0; // 0 - SC-55, 1 - CM-300/SCC-1
-int mcu_st = 0; // 0 - SC-55mk2, 1 - SC-55ST
-int mcu_jv880 = 0; // 0 - SC-55, 1 - JV880
-int mcu_scb55 = 0; // 0 - sub mcu (e.g SC-55mk2), 1 - no sub mcu (e.g SCB-55)
-int mcu_sc155 = 0; // 0 - SC-55(MK2), 1 - SC-155(MK2)
-
-static int ga_int[8];
-static int ga_int_enable = 0;
-static int ga_int_trigger = 0;
-static int ga_lcd_counter = 0;
-
-
-uint8_t dev_register[0x80];
-
-static uint16_t ad_val[4];
-static uint8_t ad_nibble = 0x00;
-static uint8_t sw_pos = 3;
-static uint8_t io_sd = 0x00;
-
-SDL_atomic_t mcu_button_pressed = { 0 };
-
-uint8_t RCU_Read(void)
+uint8_t RCU_Read(struct sc55_state *st)
 {
+    (void)st;
     return 0;
 }
 
@@ -193,8 +148,9 @@ enum {
     ANALOG_LEVEL_BATTERY = 0x2a0,
 };
 
-uint16_t MCU_SC155Sliders(uint32_t index)
+uint16_t MCU_SC155Sliders(struct sc55_state *st, uint32_t index)
 {
+    (void)st;
     // 0 - 1/9
     // 1 - 2/10
     // 2 - 3/11
@@ -207,11 +163,11 @@ uint16_t MCU_SC155Sliders(uint32_t index)
     return 0x0;
 }
 
-uint16_t MCU_AnalogReadPin(uint32_t pin)
+uint16_t MCU_AnalogReadPin(struct sc55_state *st, uint32_t pin)
 {
-    if (mcu_cm300)
+    if (st->mcu_cm300)
         return 0;
-    if (mcu_jv880)
+    if (st->mcu_jv880)
     {
         if (pin == 1)
             return ANALOG_LEVEL_BATTERY;
@@ -220,22 +176,22 @@ uint16_t MCU_AnalogReadPin(uint32_t pin)
     if (0)
     {
 READ_RCU:
-        uint8_t rcu = RCU_Read();
+        uint8_t rcu = RCU_Read(st);
         if (rcu & (1 << pin))
             return ANALOG_LEVEL_RCU_HIGH;
         else
             return ANALOG_LEVEL_RCU_LOW;
     }
-    if (mcu_mk1)
+    if (st->mcu_mk1)
     {
-        if (mcu_sc155 && (dev_register[DEV_P9DR] & 1) != 0)
+        if (st->mcu_sc155 && (st->dev_register[DEV_P9DR] & 1) != 0)
         {
-            return MCU_SC155Sliders(pin);
+            return MCU_SC155Sliders(st, pin);
         }
         if (pin == 7)
         {
-            if (mcu_sc155 && (dev_register[DEV_P9DR] & 2) != 0)
-                return MCU_SC155Sliders(8);
+            if (st->mcu_sc155 && (st->dev_register[DEV_P9DR] & 2) != 0)
+                return MCU_SC155Sliders(st, 8);
             else
                 return ANALOG_LEVEL_BATTERY;
         }
@@ -244,24 +200,24 @@ READ_RCU:
     }
     else
     {
-        if (mcu_sc155 && (io_sd & 16) != 0)
+        if (st->mcu_sc155 && (st->io_sd & 16) != 0)
         {
-            return MCU_SC155Sliders(pin);
+            return MCU_SC155Sliders(st, pin);
         }
         if (pin == 7)
         {
-            if (mcu_mk1)
+            if (st->mcu_mk1)
                 return ANALOG_LEVEL_BATTERY;
-            switch ((io_sd >> 2) & 3)
+            switch ((st->io_sd >> 2) & 3)
             {
             case 0: // Battery voltage
                 return ANALOG_LEVEL_BATTERY;
             case 1: // NC
-                if (mcu_sc155)
-                    return MCU_SC155Sliders(8);
+                if (st->mcu_sc155)
+                    return MCU_SC155Sliders(st, 8);
                 return 0;
             case 2: // SW
-                switch (sw_pos)
+                switch (st->sw_pos)
                 {
                 case 0:
                 default:
@@ -280,41 +236,30 @@ READ_RCU:
         else
             goto READ_RCU;
     }
+
+    // unreachable
+    return 0;
 }
 
-void MCU_AnalogSample(int channel)
+void MCU_AnalogSample(struct sc55_state *st, int channel)
 {
-    int value = MCU_AnalogReadPin(channel);
+    int value = MCU_AnalogReadPin(st, channel);
     int dest = (channel << 1) & 6;
-    dev_register[DEV_ADDRAH + dest] = value >> 2;
-    dev_register[DEV_ADDRAL + dest] = (value << 6) & 0xc0;
+    st->dev_register[DEV_ADDRAH + dest] = value >> 2;
+    st->dev_register[DEV_ADDRAL + dest] = (value << 6) & 0xc0;
 }
 
-int adf_rd = 0;
-
-uint64_t analog_end_time;
-
-int ssr_rd = 0;
-
-uint32_t uart_write_ptr;
-uint32_t uart_read_ptr;
-uint8_t uart_buffer[uart_buffer_size];
-
-static uint8_t uart_rx_byte;
-static uint64_t uart_rx_delay;
-static uint64_t uart_tx_delay;
-
-void MCU_DeviceWrite(uint32_t address, uint8_t data)
+void MCU_DeviceWrite(struct sc55_state *st, uint32_t address, uint8_t data)
 {
     address &= 0x7f;
     if (address >= 0x10 && address < 0x40)
     {
-        TIMER_Write(address, data);
+        TIMER_Write(st, address, data);
         return;
     }
     if (address >= 0x50 && address < 0x55)
     {
-        TIMER2_Write(address, data);
+        TIMER2_Write(st, address, data);
         return;
     }
     switch (address)
@@ -383,38 +328,38 @@ void MCU_DeviceWrite(uint32_t address, uint8_t data)
         break;
     case DEV_ADCSR:
     {
-        dev_register[address] &= ~0x7f;
-        dev_register[address] |= data & 0x7f;
-        if ((data & 0x80) == 0 && adf_rd)
+        st->dev_register[address] &= ~0x7f;
+        st->dev_register[address] |= data & 0x7f;
+        if ((data & 0x80) == 0 && st->adf_rd)
         {
-            dev_register[address] &= ~0x80;
-            MCU_Interrupt_SetRequest(INTERRUPT_SOURCE_ANALOG, 0);
+            st->dev_register[address] &= ~0x80;
+            MCU_Interrupt_SetRequest(st, INTERRUPT_SOURCE_ANALOG, 0);
         }
         if ((data & 0x40) == 0)
-            MCU_Interrupt_SetRequest(INTERRUPT_SOURCE_ANALOG, 0);
+            MCU_Interrupt_SetRequest(st, INTERRUPT_SOURCE_ANALOG, 0);
         return;
     }
     case DEV_SSR:
     {
-        if ((data & 0x80) == 0 && (ssr_rd & 0x80) != 0)
+        if ((data & 0x80) == 0 && (st->ssr_rd & 0x80) != 0)
         {
-            dev_register[address] &= ~0x80;
-            uart_tx_delay = mcu.cycles + 3000;
-            MCU_Interrupt_SetRequest(INTERRUPT_SOURCE_UART_TX, 0);
+            st->dev_register[address] &= ~0x80;
+            st->uart_tx_delay = st->mcu.cycles + 3000;
+            MCU_Interrupt_SetRequest(st, INTERRUPT_SOURCE_UART_TX, 0);
         }
-        if ((data & 0x40) == 0 && (ssr_rd & 0x40) != 0)
+        if ((data & 0x40) == 0 && (st->ssr_rd & 0x40) != 0)
         {
-            uart_rx_delay = mcu.cycles + 3000;
-            dev_register[address] &= ~0x40;
-            MCU_Interrupt_SetRequest(INTERRUPT_SOURCE_UART_RX, 0);
+            st->uart_rx_delay = st->mcu.cycles + 3000;
+            st->dev_register[address] &= ~0x40;
+            MCU_Interrupt_SetRequest(st, INTERRUPT_SOURCE_UART_RX, 0);
         }
-        if ((data & 0x20) == 0 && (ssr_rd & 0x20) != 0)
+        if ((data & 0x20) == 0 && (st->ssr_rd & 0x20) != 0)
         {
-            dev_register[address] &= ~0x20;
+            st->dev_register[address] &= ~0x20;
         }
-        if ((data & 0x10) == 0 && (ssr_rd & 0x10) != 0)
+        if ((data & 0x10) == 0 && (st->ssr_rd & 0x10) != 0)
         {
-            dev_register[address] &= ~0x10;
+            st->dev_register[address] &= ~0x10;
         }
         break;
     }
@@ -422,19 +367,19 @@ void MCU_DeviceWrite(uint32_t address, uint8_t data)
         address += 0;
         break;
     }
-    dev_register[address] = data;
+    st->dev_register[address] = data;
 }
 
-uint8_t MCU_DeviceRead(uint32_t address)
+uint8_t MCU_DeviceRead(struct sc55_state *st, uint32_t address)
 {
     address &= 0x7f;
     if (address >= 0x10 && address < 0x40)
     {
-        return TIMER_Read(address);
+        return TIMER_Read(st, address);
     }
     if (address >= 0x50 && address < 0x55)
     {
-        return TIMER_Read2(address);
+        return TIMER_Read2(st, address);
     }
     switch (address)
     {
@@ -446,29 +391,29 @@ uint8_t MCU_DeviceRead(uint32_t address)
     case DEV_ADDRCL:
     case DEV_ADDRDH:
     case DEV_ADDRDL:
-        return dev_register[address];
+        return st->dev_register[address];
     case DEV_ADCSR:
-        adf_rd = (dev_register[address] & 0x80) != 0;
-        return dev_register[address];
+        st->adf_rd = (st->dev_register[address] & 0x80) != 0;
+        return st->dev_register[address];
     case DEV_SSR:
-        ssr_rd = dev_register[address];
-        return dev_register[address];
+        st->ssr_rd = st->dev_register[address];
+        return st->dev_register[address];
     case DEV_RDR:
-        return uart_rx_byte;
+        return st->uart_rx_byte;
     case 0x00:
         return 0xff;
     case DEV_P7DR:
     {
-        if (!mcu_jv880) return 0xff;
+        if (!st->mcu_jv880) return 0xff;
 
         uint8_t data = 0xff;
-        uint32_t button_pressed = (uint32_t)SDL_AtomicGet(&mcu_button_pressed);
+        uint32_t button_pressed = st->mcu_button_pressed;
 
-        if (io_sd == 0b11111011)
+        if (st->io_sd == 0b11111011)
             data &= ((button_pressed >> 0) & 0b11111) ^ 0xFF;
-        if (io_sd == 0b11110111)
+        if (st->io_sd == 0b11110111)
             data &= ((button_pressed >> 5) & 0b11111) ^ 0xFF;
-        if (io_sd == 0b11101111)
+        if (st->io_sd == 0b11101111)
             data &= ((button_pressed >> 10) & 0b1111) ^ 0xFF;
 
         data |= 0b10000000;
@@ -477,19 +422,19 @@ uint8_t MCU_DeviceRead(uint32_t address)
     case DEV_P9DR:
     {
         int cfg = 0;
-        if (!mcu_mk1)
-            cfg = mcu_sc155 ? 0 : 2; // bit 1: 0 - SC-155mk2 (???), 1 - SC-55mk2
+        if (!st->mcu_mk1)
+            cfg = st->mcu_sc155 ? 0 : 2; // bit 1: 0 - SC-155mk2 (???), 1 - SC-55mk2
 
-        int dir = dev_register[DEV_P9DDR];
+        int dir = st->dev_register[DEV_P9DDR];
 
         int val = cfg & (dir ^ 0xff);
-        val |= dev_register[DEV_P9DR] & dir;
+        val |= st->dev_register[DEV_P9DR] & dir;
         return val;
     }
     case DEV_SCR:
     case DEV_TDR:
     case DEV_SMR:
-        return dev_register[address];
+        return st->dev_register[address];
     case DEV_IPRC:
     case DEV_IPRD:
     case DEV_DTEC:
@@ -502,67 +447,56 @@ uint8_t MCU_DeviceRead(uint32_t address)
     case DEV_FRT3_TCSR:
     case DEV_FRT3_OCRAH:
     case DEV_FRT3_OCRAL:
-        return dev_register[address];
+        return st->dev_register[address];
     }
-    return dev_register[address];
+    return st->dev_register[address];
 }
 
-void MCU_DeviceReset(void)
+void MCU_DeviceReset(struct sc55_state *st)
 {
     // dev_register[0x00] = 0x03;
     // dev_register[0x7c] = 0x87;
-    dev_register[DEV_RAME] = 0x80;
-    dev_register[DEV_SSR] = 0x80;
+    st->dev_register[DEV_RAME] = 0x80;
+    st->dev_register[DEV_SSR] = 0x80;
 }
 
-void MCU_UpdateAnalog(uint64_t cycles)
+void MCU_UpdateAnalog(struct sc55_state *st, uint64_t cycles)
 {
-    int ctrl = dev_register[DEV_ADCSR];
+    int ctrl = st->dev_register[DEV_ADCSR];
     int isscan = (ctrl & 16) != 0;
 
     if (ctrl & 0x20)
     {
-        if (analog_end_time == 0)
-            analog_end_time = cycles + 200;
-        else if (analog_end_time < cycles)
+        if (st->analog_end_time == 0)
+            st->analog_end_time = cycles + 200;
+        else if (st->analog_end_time < cycles)
         {
             if (isscan)
             {
                 int base = ctrl & 4;
                 for (int i = 0; i <= (ctrl & 3); i++)
-                    MCU_AnalogSample(base + i);
-                analog_end_time = cycles + 200;
+                    MCU_AnalogSample(st, base + i);
+                st->analog_end_time = cycles + 200;
             }
             else
             {
-                MCU_AnalogSample(ctrl & 7);
-                dev_register[DEV_ADCSR] &= ~0x20;
-                analog_end_time = 0;
+                MCU_AnalogSample(st, ctrl & 7);
+                st->dev_register[DEV_ADCSR] &= ~0x20;
+                st->analog_end_time = 0;
             }
-            dev_register[DEV_ADCSR] |= 0x80;
+            st->dev_register[DEV_ADCSR] |= 0x80;
             if (ctrl & 0x40)
-                MCU_Interrupt_SetRequest(INTERRUPT_SOURCE_ANALOG, 1);
+                MCU_Interrupt_SetRequest(st, INTERRUPT_SOURCE_ANALOG, 1);
         }
     }
     else
-        analog_end_time = 0;
+        st->analog_end_time = 0;
 }
 
-mcu_t mcu;
-
-uint8_t rom1[ROM1_SIZE];
-uint8_t rom2[ROM2_SIZE];
-uint8_t ram[RAM_SIZE];
-uint8_t sram[SRAM_SIZE];
-uint8_t nvram[NVRAM_SIZE];
-uint8_t cardram[CARDRAM_SIZE];
-
-int rom2_mask = ROM2_SIZE - 1;
-
-uint8_t MCU_Read(uint32_t address)
+uint8_t MCU_Read(struct sc55_state *st, uint32_t address)
 {
     uint32_t address_rom = address & 0x3ffff;
-    if (address & 0x80000 && !mcu_jv880)
+    if (address & 0x80000 && !st->mcu_jv880)
         address_rom |= 0x40000;
     uint8_t page = (address >> 16) & 0xf;
     address &= 0xffff;
@@ -571,36 +505,36 @@ uint8_t MCU_Read(uint32_t address)
     {
     case 0:
         if (!(address & 0x8000))
-            ret = rom1[address & 0x7fff];
+            ret = st->rom1[address & 0x7fff];
         else
         {
-            if (!mcu_mk1)
+            if (!st->mcu_mk1)
             {
-                uint16_t base = mcu_jv880 ? 0xf000 : 0xe000;
+                uint16_t base = st->mcu_jv880 ? 0xf000 : 0xe000;
                 if (address >= base && address < (base | 0x400))
                 {
-                    ret = PCM_Read(address & 0x3f);
+                    ret = PCM_Read(st, address & 0x3f);
                 }
-                else if (!mcu_scb55 && address >= 0xec00 && address < 0xf000)
+                else if (!st->mcu_scb55 && address >= 0xec00 && address < 0xf000)
                 {
-                    ret = SM_SysRead(address & 0xff);
+                    ret = SM_SysRead(st, address & 0xff);
                 }
                 else if (address >= 0xff80)
                 {
-                    ret = MCU_DeviceRead(address & 0x7f);
+                    ret = MCU_DeviceRead(st, address & 0x7f);
                 }
                 else if (address >= 0xfb80 && address < 0xff80
-                    && (dev_register[DEV_RAME] & 0x80) != 0)
-                    ret = ram[(address - 0xfb80) & 0x3ff];
+                    && (st->dev_register[DEV_RAME] & 0x80) != 0)
+                    ret = st->ram[(address - 0xfb80) & 0x3ff];
                 else if (address >= 0x8000 && address < 0xe000)
                 {
-                    ret = sram[address & 0x7fff];
+                    ret = st->sram[address & 0x7fff];
                 }
                 else if (address == (base | 0x402))
                 {
-                    ret = ga_int_trigger;
-                    ga_int_trigger = 0;
-                    MCU_Interrupt_SetRequest(mcu_jv880 ? INTERRUPT_SOURCE_IRQ0 : INTERRUPT_SOURCE_IRQ1, 0);
+                    ret = st->ga_int_trigger;
+                    st->ga_int_trigger = 0;
+                    MCU_Interrupt_SetRequest(st, st->mcu_jv880 ? INTERRUPT_SOURCE_IRQ0 : INTERRUPT_SOURCE_IRQ1, 0);
                 }
                 else
                 {
@@ -615,48 +549,48 @@ uint8_t MCU_Read(uint32_t address)
             {
                 if (address >= 0xe000 && address < 0xe040)
                 {
-                    ret = PCM_Read(address & 0x3f);
+                    ret = PCM_Read(st, address & 0x3f);
                 }
                 else if (address >= 0xff80)
                 {
-                    ret = MCU_DeviceRead(address & 0x7f);
+                    ret = MCU_DeviceRead(st, address & 0x7f);
                 }
                 else if (address >= 0xfb80 && address < 0xff80
-                    && (dev_register[DEV_RAME] & 0x80) != 0)
+                    && (st->dev_register[DEV_RAME] & 0x80) != 0)
                 {
-                    ret = ram[(address - 0xfb80) & 0x3ff];
+                    ret = st->ram[(address - 0xfb80) & 0x3ff];
                 }
                 else if (address >= 0x8000 && address < 0xe000)
                 {
-                    ret = sram[address & 0x7fff];
+                    ret = st->sram[address & 0x7fff];
                 }
                 else if (address >= 0xf000 && address < 0xf100)
                 {
-                    io_sd = address & 0xff;
+                    st->io_sd = address & 0xff;
 
-                    if (mcu_cm300)
+                    if (st->mcu_cm300)
                         return 0xff;
 
-                    LCD_Enable((io_sd & 8) != 0);
+                    LCD_Enable(st, (st->io_sd & 8) != 0);
 
                     uint8_t data = 0xff;
-                    uint32_t button_pressed = (uint32_t)SDL_AtomicGet(&mcu_button_pressed);
+                    uint32_t button_pressed = st->mcu_button_pressed;
 
-                    if ((io_sd & 1) == 0)
+                    if ((st->io_sd & 1) == 0)
                         data &= ((button_pressed >> 0) & 255) ^ 255;
-                    if ((io_sd & 2) == 0)
+                    if ((st->io_sd & 2) == 0)
                         data &= ((button_pressed >> 8) & 255) ^ 255;
-                    if ((io_sd & 4) == 0)
+                    if ((st->io_sd & 4) == 0)
                         data &= ((button_pressed >> 16) & 255) ^ 255;
-                    if ((io_sd & 8) == 0)
+                    if ((st->io_sd & 8) == 0)
                         data &= ((button_pressed >> 24) & 255) ^ 255;
                     return data;
                 }
                 else if (address == 0xf106)
                 {
-                    ret = ga_int_trigger;
-                    ga_int_trigger = 0;
-                    MCU_Interrupt_SetRequest(INTERRUPT_SOURCE_IRQ1, 0);
+                    ret = st->ga_int_trigger;
+                    st->ga_int_trigger = 0;
+                    MCU_Interrupt_SetRequest(st, INTERRUPT_SOURCE_IRQ1, 0);
                 }
                 else
                 {
@@ -671,66 +605,66 @@ uint8_t MCU_Read(uint32_t address)
         break;
 #if 0
     case 3:
-        ret = rom2[address | 0x30000];
+        ret = st->rom2[address | 0x30000];
         break;
     case 4:
-        ret = rom2[address];
+        ret = st->rom2[address];
         break;
     case 10:
-        ret = rom2[address | 0x60000]; // FIXME
+        ret = st->rom2[address | 0x60000]; // FIXME
         break;
     case 1:
-        ret = rom2[address | 0x10000];
+        ret = st->rom2[address | 0x10000];
         break;
 #endif
     case 1:
-        ret = rom2[address_rom & rom2_mask];
+        ret = st->rom2[address_rom & st->rom2_mask];
         break;
     case 2:
-        ret = rom2[address_rom & rom2_mask];
+        ret = st->rom2[address_rom & st->rom2_mask];
         break;
     case 3:
-        ret = rom2[address_rom & rom2_mask];
+        ret = st->rom2[address_rom & st->rom2_mask];
         break;
     case 4:
-        ret = rom2[address_rom & rom2_mask];
+        ret = st->rom2[address_rom & st->rom2_mask];
         break;
     case 8:
-        if (!mcu_jv880)
-            ret = rom2[address_rom & rom2_mask];
+        if (!st->mcu_jv880)
+            ret = st->rom2[address_rom & st->rom2_mask];
         else
             ret = 0xff;
         break;
     case 9:
-        if (!mcu_jv880)
-            ret = rom2[address_rom & rom2_mask];
+        if (!st->mcu_jv880)
+            ret = st->rom2[address_rom & st->rom2_mask];
         else
             ret = 0xff;
         break;
     case 14:
     case 15:
-        if (!mcu_jv880)
-            ret = rom2[address_rom & rom2_mask];
+        if (!st->mcu_jv880)
+            ret = st->rom2[address_rom & st->rom2_mask];
         else
-            ret = cardram[address & 0x7fff]; // FIXME
+            ret = st->cardram[address & 0x7fff]; // FIXME
         break;
     case 10:
     case 11:
-        if (!mcu_mk1)
-            ret = sram[address & 0x7fff]; // FIXME
+        if (!st->mcu_mk1)
+            ret = st->sram[address & 0x7fff]; // FIXME
         else
             ret = 0xff;
         break;
     case 12:
     case 13:
-        if (mcu_jv880)
-            ret = nvram[address & 0x7fff]; // FIXME
+        if (st->mcu_jv880)
+            ret = st->nvram[address & 0x7fff]; // FIXME
         else
             ret = 0xff;
         break;
     case 5:
-        if (mcu_mk1)
-            ret = sram[address & 0x7fff]; // FIXME
+        if (st->mcu_mk1)
+            ret = st->sram[address & 0x7fff]; // FIXME
         else
             ret = 0xff;
         break;
@@ -741,27 +675,27 @@ uint8_t MCU_Read(uint32_t address)
     return ret;
 }
 
-uint16_t MCU_Read16(uint32_t address)
+uint16_t MCU_Read16(struct sc55_state *st, uint32_t address)
 {
     address &= ~1;
     uint8_t b0, b1;
-    b0 = MCU_Read(address);
-    b1 = MCU_Read(address+1);
+    b0 = MCU_Read(st, address);
+    b1 = MCU_Read(st, address+1);
     return (b0 << 8) + b1;
 }
 
-uint32_t MCU_Read32(uint32_t address)
+uint32_t MCU_Read32(struct sc55_state *st, uint32_t address)
 {
     address &= ~3;
     uint8_t b0, b1, b2, b3;
-    b0 = MCU_Read(address);
-    b1 = MCU_Read(address+1);
-    b2 = MCU_Read(address+2);
-    b3 = MCU_Read(address+3);
+    b0 = MCU_Read(st, address);
+    b1 = MCU_Read(st, address+1);
+    b2 = MCU_Read(st, address+2);
+    b3 = MCU_Read(st, address+3);
     return (b0 << 24) + (b1 << 16) + (b2 << 8) + b3;
 }
 
-void MCU_Write(uint32_t address, uint8_t value)
+void MCU_Write(struct sc55_state *st, uint32_t address, uint8_t value)
 {
     uint8_t page = (address >> 16) & 0xf;
     address &= 0xffff;
@@ -769,20 +703,20 @@ void MCU_Write(uint32_t address, uint8_t value)
     {
         if (address & 0x8000)
         {
-            if (!mcu_mk1)
+            if (!st->mcu_mk1)
             {
-                uint16_t base = mcu_jv880 ? 0xf000 : 0xe000;
+                uint16_t base = st->mcu_jv880 ? 0xf000 : 0xe000;
                 if (address >= (base | 0x400) && address < (base | 0x800))
                 {
                     if (address == (base | 0x404) || address == (base | 0x405))
-                        LCD_Write(address & 1, value);
+                        LCD_Write(st, address & 1, value);
                     else if (address == (base | 0x401))
                     {
-                        io_sd = value;
-                        LCD_Enable((value & 1) == 0);
+                        st->io_sd = value;
+                        LCD_Enable(st, (value & 1) == 0);
                     }
                     else if (address == (base | 0x402))
-                        ga_int_enable = (value << 1);
+                        st->ga_int_enable = (value << 1);
                     else
                         printf("Unknown write %x %x\n", address, value);
                     //
@@ -798,24 +732,24 @@ void MCU_Write(uint32_t address, uint8_t value)
                 }
                 else if (address >= (base | 0x000) && address < (base | 0x400))
                 {
-                    PCM_Write(address & 0x3f, value);
+                    PCM_Write(st, address & 0x3f, value);
                 }
-                else if (!mcu_scb55 && address >= 0xec00 && address < 0xf000)
+                else if (!st->mcu_scb55 && address >= 0xec00 && address < 0xf000)
                 {
-                    SM_SysWrite(address & 0xff, value);
+                    SM_SysWrite(st, address & 0xff, value);
                 }
                 else if (address >= 0xff80)
                 {
-                    MCU_DeviceWrite(address & 0x7f, value);
+                    MCU_DeviceWrite(st, address & 0x7f, value);
                 }
                 else if (address >= 0xfb80 && address < 0xff80
-                    && (dev_register[DEV_RAME] & 0x80) != 0)
+                    && (st->dev_register[DEV_RAME] & 0x80) != 0)
                 {
-                    ram[(address - 0xfb80) & 0x3ff] = value;
+                    st->ram[(address - 0xfb80) & 0x3ff] = value;
                 }
                 else if (address >= 0x8000 && address < 0xe000)
                 {
-                    sram[address & 0x7fff] = value;
+                    st->sram[address & 0x7fff] = value;
                 }
                 else
                 {
@@ -826,39 +760,39 @@ void MCU_Write(uint32_t address, uint8_t value)
             {
                 if (address >= 0xe000 && address < 0xe040)
                 {
-                    PCM_Write(address & 0x3f, value);
+                    PCM_Write(st, address & 0x3f, value);
                 }
                 else if (address >= 0xff80)
                 {
-                    MCU_DeviceWrite(address & 0x7f, value);
+                    MCU_DeviceWrite(st, address & 0x7f, value);
                 }
                 else if (address >= 0xfb80 && address < 0xff80
-                    && (dev_register[DEV_RAME] & 0x80) != 0)
+                    && (st->dev_register[DEV_RAME] & 0x80) != 0)
                 {
-                    ram[(address - 0xfb80) & 0x3ff] = value;
+                    st->ram[(address - 0xfb80) & 0x3ff] = value;
                 }
                 else if (address >= 0x8000 && address < 0xe000)
                 {
-                    sram[address & 0x7fff] = value;
+                    st->sram[address & 0x7fff] = value;
                 }
                 else if (address >= 0xf000 && address < 0xf100)
                 {
-                    io_sd = address & 0xff;
-                    LCD_Enable((io_sd & 8) != 0);
+                    st->io_sd = address & 0xff;
+                    LCD_Enable(st, (st->io_sd & 8) != 0);
                 }
                 else if (address == 0xf105)
                 {
-                    LCD_Write(0, value);
-                    ga_lcd_counter = 500;
+                    LCD_Write(st, 0, value);
+                    st->ga_lcd_counter = 500;
                 }
                 else if (address == 0xf104)
                 {
-                    LCD_Write(1, value);
-                    ga_lcd_counter = 500;
+                    LCD_Write(st, 1, value);
+                    st->ga_lcd_counter = 500;
                 }
                 else if (address == 0xf107)
                 {
-                    io_sd = value;
+                    st->io_sd = value;
                 }
                 else
                 {
@@ -866,7 +800,7 @@ void MCU_Write(uint32_t address, uint8_t value)
                 }
             }
         }
-        else if (mcu_jv880 && address >= 0x6196 && address <= 0x6199)
+        else if (st->mcu_jv880 && address >= 0x6196 && address <= 0x6199)
         {
             // nop: the jv880 rom writes into the rom at 002E77-002E7D
         }
@@ -875,21 +809,21 @@ void MCU_Write(uint32_t address, uint8_t value)
             printf("Unknown write %x %x\n", address, value);
         }
     }
-    else if (page == 5 && mcu_mk1)
+    else if (page == 5 && st->mcu_mk1)
     {
-        sram[address & 0x7fff] = value; // FIXME
+        st->sram[address & 0x7fff] = value; // FIXME
     }
-    else if (page == 10 && !mcu_mk1)
+    else if (page == 10 && !st->mcu_mk1)
     {
-        sram[address & 0x7fff] = value; // FIXME
+        st->sram[address & 0x7fff] = value; // FIXME
     }
-    else if (page == 12 && mcu_jv880)
+    else if (page == 12 && st->mcu_jv880)
     {
-        nvram[address & 0x7fff] = value; // FIXME
+        st->nvram[address & 0x7fff] = value; // FIXME
     }
-    else if (page == 14 && mcu_jv880)
+    else if (page == 14 && st->mcu_jv880)
     {
-        cardram[address & 0x7fff] = value; // FIXME
+        st->cardram[address & 0x7fff] = value; // FIXME
     }
     else
     {
@@ -897,253 +831,206 @@ void MCU_Write(uint32_t address, uint8_t value)
     }
 }
 
-void MCU_Write16(uint32_t address, uint16_t value)
+void MCU_Write16(struct sc55_state *st, uint32_t address, uint16_t value)
 {
     address &= ~1;
-    MCU_Write(address, value >> 8);
-    MCU_Write(address + 1, value & 0xff);
+    MCU_Write(st, address, value >> 8);
+    MCU_Write(st, address + 1, value & 0xff);
 }
 
-void MCU_ReadInstruction(void)
+void MCU_ReadInstruction(struct sc55_state *st)
 {
-    uint8_t operand = MCU_ReadCodeAdvance();
+    uint8_t operand = MCU_ReadCodeAdvance(st);
 
-    MCU_Operand_Table[operand](operand);
+    MCU_Operand_Table[operand](st, operand);
 
-    if (mcu.sr & STATUS_T)
+    if (st->mcu.sr & STATUS_T)
     {
-        MCU_Interrupt_Exception(EXCEPTION_SOURCE_TRACE);
+        MCU_Interrupt_Exception(st, EXCEPTION_SOURCE_TRACE);
     }
 }
 
-void MCU_Init(void)
+void MCU_Init(struct sc55_state *st)
 {
-    memset(&mcu, 0, sizeof(mcu_t));
+    memset(&st->mcu, 0, sizeof(mcu_t));
 }
 
-void MCU_Reset(void)
+void MCU_Reset(struct sc55_state *st)
 {
-    mcu.r[0] = 0;
-    mcu.r[1] = 0;
-    mcu.r[2] = 0;
-    mcu.r[3] = 0;
-    mcu.r[4] = 0;
-    mcu.r[5] = 0;
-    mcu.r[6] = 0;
-    mcu.r[7] = 0;
+    st->mcu.r[0] = 0;
+    st->mcu.r[1] = 0;
+    st->mcu.r[2] = 0;
+    st->mcu.r[3] = 0;
+    st->mcu.r[4] = 0;
+    st->mcu.r[5] = 0;
+    st->mcu.r[6] = 0;
+    st->mcu.r[7] = 0;
 
-    mcu.pc = 0;
+    st->mcu.pc = 0;
 
-    mcu.sr = 0x700;
+    st->mcu.sr = 0x700;
 
-    mcu.cp = 0;
-    mcu.dp = 0;
-    mcu.ep = 0;
-    mcu.tp = 0;
-    mcu.br = 0;
+    st->mcu.cp = 0;
+    st->mcu.dp = 0;
+    st->mcu.ep = 0;
+    st->mcu.tp = 0;
+    st->mcu.br = 0;
 
-    uint32_t reset_address = MCU_GetVectorAddress(VECTOR_RESET);
-    mcu.cp = (reset_address >> 16) & 0xff;
-    mcu.pc = reset_address & 0xffff;
+    uint32_t reset_address = MCU_GetVectorAddress(st, VECTOR_RESET);
+    st->mcu.cp = (reset_address >> 16) & 0xff;
+    st->mcu.pc = reset_address & 0xffff;
 
-    mcu.exception_pending = -1;
+    st->mcu.exception_pending = -1;
 
-    MCU_DeviceReset();
+    MCU_DeviceReset(st);
 
-    if (mcu_mk1)
+    if (st->mcu_mk1)
     {
-        ga_int_enable = 255;
+        st->ga_int_enable = 255;
     }
 }
 
-void MCU_PostUART(uint8_t data)
+void MCU_PostUART(struct sc55_state *st, uint8_t data)
 {
-    uart_buffer[uart_write_ptr] = data;
-    uart_write_ptr = (uart_write_ptr + 1) % uart_buffer_size;
+    st->uart_buffer[st->uart_write_ptr] = data;
+    st->uart_write_ptr = (st->uart_write_ptr + 1) % uart_buffer_size;
 }
 
-void MCU_UpdateUART_RX(void)
+void MCU_UpdateUART_RX(struct sc55_state *st)
 {
-    if ((dev_register[DEV_SCR] & 16) == 0) // RX disabled
+    if ((st->dev_register[DEV_SCR] & 16) == 0) // RX disabled
         return;
-    if (uart_write_ptr == uart_read_ptr) // no byte
-        return;
-
-    if (dev_register[DEV_SSR] & 0x40)
+    if (st->uart_write_ptr == st->uart_read_ptr) // no byte
         return;
 
-    if (mcu.cycles < uart_rx_delay)
+    if (st->dev_register[DEV_SSR] & 0x40)
         return;
 
-    uart_rx_byte = uart_buffer[uart_read_ptr];
-    uart_read_ptr = (uart_read_ptr + 1) % uart_buffer_size;
-    dev_register[DEV_SSR] |= 0x40;
-    MCU_Interrupt_SetRequest(INTERRUPT_SOURCE_UART_RX, (dev_register[DEV_SCR] & 0x40) != 0);
+    if (st->mcu.cycles < st->uart_rx_delay)
+        return;
+
+    st->uart_rx_byte = st->uart_buffer[st->uart_read_ptr];
+    st->uart_read_ptr = (st->uart_read_ptr + 1) % uart_buffer_size;
+    st->dev_register[DEV_SSR] |= 0x40;
+    MCU_Interrupt_SetRequest(st, INTERRUPT_SOURCE_UART_RX, (st->dev_register[DEV_SCR] & 0x40) != 0);
 }
 
 // dummy TX
-void MCU_UpdateUART_TX(void)
+void MCU_UpdateUART_TX(struct sc55_state *st)
 {
-    if ((dev_register[DEV_SCR] & 32) == 0) // TX disabled
+    if ((st->dev_register[DEV_SCR] & 32) == 0) // TX disabled
         return;
 
-    if (dev_register[DEV_SSR] & 0x80)
+    if (st->dev_register[DEV_SSR] & 0x80)
         return;
 
-    if (mcu.cycles < uart_tx_delay)
+    if (st->mcu.cycles < st->uart_tx_delay)
         return;
 
-    dev_register[DEV_SSR] |= 0x80;
-    MCU_Interrupt_SetRequest(INTERRUPT_SOURCE_UART_TX, (dev_register[DEV_SCR] & 0x80) != 0);
+    st->dev_register[DEV_SSR] |= 0x80;
+    MCU_Interrupt_SetRequest(st, INTERRUPT_SOURCE_UART_TX, (st->dev_register[DEV_SCR] & 0x80) != 0);
 
     // printf("tx:%x\n", dev_register[DEV_TDR]);
 }
 
-static bool work_thread_run = false;
-
-static SDL_mutex *work_thread_lock;
-
-void MCU_WorkThread_Lock(void)
-{
-    SDL_LockMutex(work_thread_lock);
-}
-
-void MCU_WorkThread_Unlock(void)
-{
-    SDL_UnlockMutex(work_thread_lock);
-}
-
-int SDLCALL work_thread(void* data)
-{
-    work_thread_lock = SDL_CreateMutex();
-
-    MCU_WorkThread_Lock();
-    while (work_thread_run)
+static void MCU_Work(struct sc55_state *st) {
+    while (st->sample_buffer_requested && st->sample_buffer_count < st->audio_buffer_size)
     {
-        if (pcm.config_reg_3c & 0x40)
-            sample_write_ptr &= ~3;
+        if (st->pcm.config_reg_3c & 0x40)
+            st->sample_write_ptr &= ~3;
         else
-            sample_write_ptr &= ~1;
-        if (sample_read_ptr == sample_write_ptr)
+            st->sample_write_ptr &= ~1;
+
+        if (st->sample_buffer_count > 0)
         {
-            MCU_WorkThread_Unlock();
-            while (sample_read_ptr == sample_write_ptr)
+            if (st->sample_buffer_count >= st->sample_buffer_requested)
             {
-                SDL_Delay(1);
+                st->sample_buffer_requested = 0;
+                break;
             }
-            MCU_WorkThread_Lock();
         }
 
-        if (!mcu.ex_ignore)
-            MCU_Interrupt_Handle();
+        if (!st->mcu.ex_ignore)
+            MCU_Interrupt_Handle(st);
         else
-            mcu.ex_ignore = 0;
+            st->mcu.ex_ignore = 0;
 
-        if (!mcu.sleep)
-            MCU_ReadInstruction();
+        if (!st->mcu.sleep)
+            MCU_ReadInstruction(st);
 
-        mcu.cycles += 12; // FIXME: assume 12 cycles per instruction
+        st->mcu.cycles += 12; // FIXME: assume 12 cycles per instruction
 
         // if (mcu.cycles % 24000000 == 0)
         //     printf("seconds: %i\n", (int)(mcu.cycles / 24000000));
 
-        PCM_Update(mcu.cycles);
+        PCM_Update(st, st->mcu.cycles);
 
-        TIMER_Clock(mcu.cycles);
+        TIMER_Clock(st, st->mcu.cycles);
 
-        if (!mcu_mk1 && !mcu_jv880 && !mcu_scb55)
-            SM_Update(mcu.cycles);
+        if (!st->mcu_mk1 && !st->mcu_jv880 && !st->mcu_scb55)
+            SM_Update(st, st->mcu.cycles);
         else
         {
-            MCU_UpdateUART_RX();
-            MCU_UpdateUART_TX();
+            MCU_UpdateUART_RX(st);
+            MCU_UpdateUART_TX(st);
         }
 
-        MCU_UpdateAnalog(mcu.cycles);
+        MCU_UpdateAnalog(st, st->mcu.cycles);
 
-        if (mcu_mk1)
+        if (st->mcu_mk1)
         {
-            if (ga_lcd_counter)
+            if (st->ga_lcd_counter)
             {
-                ga_lcd_counter--;
-                if (ga_lcd_counter == 0)
+                st->ga_lcd_counter--;
+                if (st->ga_lcd_counter == 0)
                 {
-                    MCU_GA_SetGAInt(1, 0);
-                    MCU_GA_SetGAInt(1, 1);
+                    MCU_GA_SetGAInt(st, 1, 0);
+                    MCU_GA_SetGAInt(st, 1, 1);
                 }
             }
         }
     }
-    MCU_WorkThread_Unlock();
-
-    SDL_DestroyMutex(work_thread_lock);
-
-    return 0;
 }
 
-static void MCU_Run()
+void MCU_PatchROM(struct sc55_state *st)
 {
-    bool working = true;
-
-    work_thread_run = true;
-    SDL_Thread *thread = SDL_CreateThread(work_thread, "work thread", 0);
-
-    while (working)
-    {
-        if(LCD_QuitRequested())
-            working = false;
-
-        LCD_Update();
-        SDL_Delay(15);
-    }
-
-    work_thread_run = false;
-    SDL_WaitThread(thread, 0);
+    //st->rom2[0x1333] = 0x11;
+    //st->rom2[0x1334] = 0x19;
+    //st->rom1[0x622d] = 0x19;
 }
 
-void MCU_PatchROM(void)
+uint8_t MCU_ReadP0(struct sc55_state *st)
 {
-    //rom2[0x1333] = 0x11;
-    //rom2[0x1334] = 0x19;
-    //rom1[0x622d] = 0x19;
-}
-
-uint8_t mcu_p0_data = 0x00;
-uint8_t mcu_p1_data = 0x00;
-
-uint8_t MCU_ReadP0(void)
-{
+    (void)st;
     return 0xff;
 }
 
-uint8_t MCU_ReadP1(void)
+uint8_t MCU_ReadP1(struct sc55_state *st)
 {
     uint8_t data = 0xff;
-    uint32_t button_pressed = (uint32_t)SDL_AtomicGet(&mcu_button_pressed);
+    uint32_t button_pressed = st->mcu_button_pressed;
 
-    if ((mcu_p0_data & 1) == 0)
+    if ((st->mcu_p0_data & 1) == 0)
         data &= ((button_pressed >> 0) & 255) ^ 255;
-    if ((mcu_p0_data & 2) == 0)
+    if ((st->mcu_p0_data & 2) == 0)
         data &= ((button_pressed >> 8) & 255) ^ 255;
-    if ((mcu_p0_data & 4) == 0)
+    if ((st->mcu_p0_data & 4) == 0)
         data &= ((button_pressed >> 16) & 255) ^ 255;
-    if ((mcu_p0_data & 8) == 0)
+    if ((st->mcu_p0_data & 8) == 0)
         data &= ((button_pressed >> 24) & 255) ^ 255;
 
     return data;
 }
 
-void MCU_WriteP0(uint8_t data)
+void MCU_WriteP0(struct sc55_state *st, uint8_t data)
 {
-    mcu_p0_data = data;
+    st->mcu_p0_data = data;
 }
 
-void MCU_WriteP1(uint8_t data)
+void MCU_WriteP1(struct sc55_state *st, uint8_t data)
 {
-    mcu_p1_data = data;
+    st->mcu_p1_data = data;
 }
-
-uint8_t tempbuf[0x800000];
 
 void unscramble(uint8_t *src, uint8_t *dst, int len)
 {
@@ -1172,115 +1059,39 @@ void unscramble(uint8_t *src, uint8_t *dst, int len)
     }
 }
 
-void audio_callback(void* /*userdata*/, Uint8* stream, int len)
+int MCU_OpenAudio(struct sc55_state *st, int pageSize, int pageNum)
 {
-    len /= 2;
-    memcpy(stream, &sample_buffer[sample_read_ptr], len * 2);
-    memset(&sample_buffer[sample_read_ptr], 0, len * 2);
-    sample_read_ptr += len;
-    sample_read_ptr %= audio_buffer_size;
-}
+    st->audio_page_size = (pageSize/2)*2; // must be even
+    st->audio_buffer_size = st->audio_page_size*pageNum;
 
-static const char* audio_format_to_str(int format)
-{
-    switch(format)
-    {
-    case AUDIO_S8:
-        return "S8";
-    case AUDIO_U8:
-        return "U8";
-    case AUDIO_S16MSB:
-        return "S16MSB";
-    case AUDIO_S16LSB:
-        return "S16LSB";
-    case AUDIO_U16MSB:
-        return "U16MSB";
-    case AUDIO_U16LSB:
-        return "U16LSB";
-    case AUDIO_S32MSB:
-        return "S32MSB";
-    case AUDIO_S32LSB:
-        return "S32LSB";
-    case AUDIO_F32MSB:
-        return "F32MSB";
-    case AUDIO_F32LSB:
-        return "F32LSB";
-    }
-    return "UNK";
-}
-
-int MCU_OpenAudio(int deviceIndex, int pageSize, int pageNum)
-{
-    SDL_AudioSpec spec = {};
-    SDL_AudioSpec spec_actual = {};
-
-    audio_page_size = (pageSize/2)*2; // must be even
-    audio_buffer_size = audio_page_size*pageNum;
+    st->sample_rate = (st->mcu_mk1 || st->mcu_jv880) ? 64000 : 66207;
     
-    spec.format = AUDIO_S16SYS;
-    spec.freq = (mcu_mk1 || mcu_jv880) ? 64000 : 66207;
-    spec.channels = 2;
-    spec.callback = audio_callback;
-    spec.samples = audio_page_size / 4;
-    
-    sample_buffer = (short*)calloc(audio_buffer_size, sizeof(short));
-    if (!sample_buffer)
+    st->sample_buffer = (short*)calloc(st->audio_buffer_size, sizeof(short));
+    if (!st->sample_buffer)
     {
         printf("Cannot allocate audio buffer.\n");
         return 0;
     }
-    sample_read_ptr = 0;
-    sample_write_ptr = 0;
+    st->sample_read_ptr = 0;
+    st->sample_write_ptr = 0;
+    st->sample_buffer_count = 0;
     
-    int num = SDL_GetNumAudioDevices(0);
-    if (num == 0)
-    {
-        printf("No audio output device found.\n");
-        return 0;
-    }
-    
-    if (deviceIndex < -1 || deviceIndex >= num)
-    {
-        printf("Out of range audio device index is requested. Default audio output device is selected.\n");
-        deviceIndex = -1;
-    }
-    
-    const char* audioDevicename = deviceIndex == -1 ? "Default device" : SDL_GetAudioDeviceName(deviceIndex, 0);
-    
-    sdl_audio = SDL_OpenAudioDevice(deviceIndex == -1 ? NULL : audioDevicename, 0, &spec, &spec_actual, 0);
-    if (!sdl_audio)
-    {
-        return 0;
-    }
-
-    printf("Audio device: %s\n", audioDevicename);
-
-    printf("Audio Requested: F=%s, C=%d, R=%d, B=%d\n",
-           audio_format_to_str(spec.format),
-           spec.channels,
-           spec.freq,
-           spec.samples);
-
-    printf("Audio Actual: F=%s, C=%d, R=%d, B=%d\n",
-           audio_format_to_str(spec_actual.format),
-           spec_actual.channels,
-           spec_actual.freq,
-           spec_actual.samples);
-    fflush(stdout);
-
-    SDL_PauseAudioDevice(sdl_audio, 0);
-
     return 1;
 }
 
-void MCU_CloseAudio(void)
+void MCU_CloseAudio(struct sc55_state *st)
 {
-    SDL_CloseAudio();
-    if (sample_buffer) free(sample_buffer);
+    if (st->sample_buffer) {
+        free(st->sample_buffer);
+        st->sample_buffer = NULL;
+    }
 }
 
-void MCU_PostSample(int *sample)
+void MCU_PostSample(struct sc55_state *st, int *sample)
 {
+    if(st->sample_buffer_count >= st->audio_buffer_size)
+        return;
+
     sample[0] >>= 15;
     if (sample[0] > INT16_MAX)
         sample[0] = INT16_MAX;
@@ -1291,58 +1102,33 @@ void MCU_PostSample(int *sample)
         sample[1] = INT16_MAX;
     else if (sample[1] < INT16_MIN)
         sample[1] = INT16_MIN;
-    sample_buffer[sample_write_ptr + 0] = sample[0];
-    sample_buffer[sample_write_ptr + 1] = sample[1];
-    sample_write_ptr = (sample_write_ptr + 2) % audio_buffer_size;
+    st->sample_buffer[st->sample_write_ptr + 0] = sample[0];
+    st->sample_buffer[st->sample_write_ptr + 1] = sample[1];
+    st->sample_write_ptr = (st->sample_write_ptr + 2) % st->audio_buffer_size;
+    st->sample_buffer_count++;
 }
 
-void MCU_GA_SetGAInt(int line, int value)
+void MCU_GA_SetGAInt(struct sc55_state *st, int line, int value)
 {
     // guesswork
-    if (value && !ga_int[line] && (ga_int_enable & (1 << line)) != 0)
-        ga_int_trigger = line;
-    ga_int[line] = value;
+    if (value && !st->ga_int[line] && (st->ga_int_enable & (1 << line)) != 0)
+        st->ga_int_trigger = line;
+    st->ga_int[line] = value;
 
-    if (mcu_jv880)
-        MCU_Interrupt_SetRequest(INTERRUPT_SOURCE_IRQ0, ga_int_trigger != 0);
+    if (st->mcu_jv880)
+        MCU_Interrupt_SetRequest(st, INTERRUPT_SOURCE_IRQ0, st->ga_int_trigger != 0);
     else
-        MCU_Interrupt_SetRequest(INTERRUPT_SOURCE_IRQ1, ga_int_trigger != 0);
+        MCU_Interrupt_SetRequest(st, INTERRUPT_SOURCE_IRQ1, st->ga_int_trigger != 0);
 }
 
-void MCU_EncoderTrigger(int dir)
+void MCU_EncoderTrigger(struct sc55_state *st, int dir)
 {
-    if (!mcu_jv880) return;
-    MCU_GA_SetGAInt(dir == 0 ? 3 : 4, 0);
-    MCU_GA_SetGAInt(dir == 0 ? 3 : 4, 1);
+    if (!st->mcu_jv880) return;
+    MCU_GA_SetGAInt(st, dir == 0 ? 3 : 4, 0);
+    MCU_GA_SetGAInt(st, dir == 0 ? 3 : 4, 1);
 }
 
-static FILE *s_rf[ROM_SET_N_FILES] =
-{
-    nullptr,
-    nullptr,
-    nullptr,
-    nullptr,
-    nullptr,
-    nullptr
-};
-
-static void closeAllR()
-{
-    for(size_t i = 0; i < ROM_SET_N_FILES; ++i)
-    {
-        if(s_rf[i])
-            fclose(s_rf[i]);
-        s_rf[i] = nullptr;
-    }
-}
-
-enum class ResetType {
-    NONE,
-    GS_RESET,
-    GM_RESET,
-};
-
-void MIDI_Reset(ResetType resetType)
+void MIDI_Reset(struct sc55_state *st, ResetType resetType)
 {
     const unsigned char gmReset[] = { 0xF0, 0x7E, 0x7F, 0x09, 0x01, 0xF7 };
     const unsigned char gsReset[] = { 0xF0, 0x41, 0x10, 0x42, 0x12, 0x40, 0x00, 0x7F, 0x00, 0x41, 0xF7 };
@@ -1351,425 +1137,374 @@ void MIDI_Reset(ResetType resetType)
     {
         for (size_t i = 0; i < sizeof(gsReset); i++)
         {
-            MCU_PostUART(gsReset[i]);
+            MCU_PostUART(st, gsReset[i]);
         }
     }
     else  if (resetType == ResetType::GM_RESET)
     {
         for (size_t i = 0; i < sizeof(gmReset); i++)
         {
-            MCU_PostUART(gmReset[i]);
+            MCU_PostUART(st, gmReset[i]);
         }
     }
 
 }
 
-int main(int argc, char *argv[])
+struct sc55_state * sc55_init(int port, ResetType resetType, sc55_read_rom readCallback, void *readContext)
 {
-    (void)argc;
-    std::string basePath;
+    struct sc55_state *st = (struct sc55_state *) calloc(1, sizeof(*st));
+    if (!st)
+        return NULL;
 
-    int port = 0;
-    int audioDeviceIndex = -1;
-    int pageSize = 512;
-    int pageNum = 32;
+    // static init
+    st->sw_pos = 3;
+    st->rom2_mask = ROM2_SIZE - 1;
+    st->lcd_width = 741;
+    st->lcd_height = 268;
+    st->lcd_col1 = 0x000000;
+    st->lcd_col2 = 0x0050c8;
+
+    st->lcd_enable = 1;
+    //st->lcd_quit_requested = false;
+
+    const int pageSize = 512;
+    const int pageNum = 8;
     bool autodetect = true;
-    ResetType resetType = ResetType::NONE;
 
-    romset = ROM_SET_MK2;
-
-    {
-        for (int i = 1; i < argc; i++)
-        {
-            if (!strncmp(argv[i], "-p:", 3))
-            {
-                port = atoi(argv[i] + 3);
-            }
-            else if (!strncmp(argv[i], "-a:", 3))
-            {
-                audioDeviceIndex = atoi(argv[i] + 3);
-            }
-            else if (!strncmp(argv[i], "-ab:", 4))
-            {
-                char* pColon = argv[i] + 3;
-                
-                if (pColon[1] != 0)
-                {
-                    pageSize = atoi(++pColon);
-                    pColon = strchr(pColon, ':');
-                    if (pColon && pColon[1] != 0)
-                    {
-                        pageNum = atoi(++pColon);
-                    }
-                }
-                
-                // reset both if either is invalid
-                if (pageSize <= 0 || pageNum <= 0)
-                {
-                    pageSize = 512;
-                    pageNum = 32;
-                }
-            }
-            else if (!strcmp(argv[i], "-mk2"))
-            {
-                romset = ROM_SET_MK2;
-                autodetect = false;
-            }
-            else if (!strcmp(argv[i], "-st"))
-            {
-                romset = ROM_SET_ST;
-                autodetect = false;
-            }
-            else if (!strcmp(argv[i], "-mk1"))
-            {
-                romset = ROM_SET_MK1;
-                autodetect = false;
-            }
-            else if (!strcmp(argv[i], "-cm300"))
-            {
-                romset = ROM_SET_CM300;
-                autodetect = false;
-            }
-            else if (!strcmp(argv[i], "-jv880"))
-            {
-                romset = ROM_SET_JV880;
-                autodetect = false;
-            }
-            else if (!strcmp(argv[i], "-scb55"))
-            {
-                romset = ROM_SET_SCB55;
-                autodetect = false;
-            }
-            else if (!strcmp(argv[i], "-rlp3237"))
-            {
-                romset = ROM_SET_RLP3237;
-                autodetect = false;
-            }
-            else if (!strcmp(argv[i], "-gs"))
-            {
-                resetType = ResetType::GS_RESET;
-            }
-            else if (!strcmp(argv[i], "-gm"))
-            {
-                resetType = ResetType::GM_RESET;
-            }
-            else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "-help") || !strcmp(argv[i], "--help"))
-            {
-                // TODO: Might want to try to find a way to print out the executable's actual name (without any full paths).
-                printf("Usage: nuked-sc55 [options]\n");
-                printf("Options:\n");
-                printf("  -h, -help, --help              Display this information.\n");
-                printf("\n");
-                printf("  -p:<port_number>               Set MIDI port.\n");
-                printf("  -a:<device_number>             Set Audio Device index.\n");
-                printf("  -ab:<page_size>:[page_count]   Set Audio Buffer size.\n");
-                printf("\n");
-                printf("  -mk2                           Use SC-55mk2 ROM set.\n");
-                printf("  -st                            Use SC-55st ROM set.\n");
-                printf("  -mk1                           Use SC-55mk1 ROM set.\n");
-                printf("  -cm300                         Use CM-300/SCC-1 ROM set.\n");
-                printf("  -jv880                         Use JV-880 ROM set.\n");
-                printf("  -scb55                         Use SCB-55 ROM set.\n");
-                printf("  -rlp3237                       Use RLP-3237 ROM set.\n");
-                printf("\n");
-                printf("  -gs                            Reset system in GS mode.\n");
-                printf("  -gm                            Reset system in GM mode.\n");
-                return 0;
-            }
-            else if (!strcmp(argv[i], "-sc155"))
-            {
-                romset = ROM_SET_SC155;
-                autodetect = false;
-            }
-            else if (!strcmp(argv[i], "-sc155mk2"))
-            {
-                romset = ROM_SET_SC155MK2;
-                autodetect = false;
-            }
-        }
-    }
-
-#if __linux__
-    char self_path[PATH_MAX];
-    memset(&self_path[0], 0, PATH_MAX);
-
-    if(readlink("/proc/self/exe", self_path, PATH_MAX) == -1)
-        basePath = Files::real_dirname(argv[0]);
-    else
-        basePath = Files::dirname(self_path);
-#else
-    basePath = Files::real_dirname(argv[0]);
-#endif
-
-    printf("Base path is: %s\n", argv[0]);
-
-    if(Files::dirExists(basePath + "/../share/nuked-sc55"))
-        basePath += "/../share/nuked-sc55";
+    st->romset = ROM_SET_MK2;
 
     if (autodetect)
     {
+        bool good = true;
         for (size_t i = 0; i < ROM_SET_COUNT; i++)
         {
-            bool good = true;
+            good = true;
             for (size_t j = 0; j < 5; j++)
             {
                 if (roms[i][j][0] == '\0')
                     continue;
-                std::string path = basePath + "/" + roms[i][j];
-                auto h = Files::utf8_fopen(path.c_str(), "rb");
-                if (!h)
+                int r = readCallback(readContext, roms[i][j], NULL, NULL);
+                if (r < 0)
                 {
                     good = false;
                     break;
                 }
-                fclose(h);
             }
             if (good)
             {
-                romset = i;
+                st->romset = (int)i;
                 break;
             }
         }
-        printf("ROM set autodetect: %s\n", rs_name[romset]);
+        if (!good) {
+            free(st);
+            return nullptr;
+        }
+        printf("ROM set autodetect: %s\n", rs_name[st->romset]);
     }
 
-    mcu_mk1 = false;
-    mcu_cm300 = false;
-    mcu_st = false;
-    mcu_jv880 = false;
-    mcu_scb55 = false;
-    mcu_sc155 = false;
-    switch (romset)
+    st->mcu_mk1 = false;
+    st->mcu_cm300 = false;
+    st->mcu_st = false;
+    st->mcu_jv880 = false;
+    st->mcu_scb55 = false;
+    st->mcu_sc155 = false;
+    switch (st->romset)
     {
         case ROM_SET_MK2:
         case ROM_SET_SC155MK2:
-            if (romset == ROM_SET_SC155MK2)
-                mcu_sc155 = true;
+            if (st->romset == ROM_SET_SC155MK2)
+                st->mcu_sc155 = true;
             break;
         case ROM_SET_ST:
-            mcu_st = true;
+            st->mcu_st = true;
             break;
         case ROM_SET_MK1:
         case ROM_SET_SC155:
-            mcu_mk1 = true;
-            mcu_st = false;
-            if (romset == ROM_SET_SC155)
-                mcu_sc155 = true;
+            st->mcu_mk1 = true;
+            st->mcu_st = false;
+            if (st->romset == ROM_SET_SC155)
+                st->mcu_sc155 = true;
             break;
         case ROM_SET_CM300:
-            mcu_mk1 = true;
-            mcu_cm300 = true;
+            st->mcu_mk1 = true;
+            st->mcu_cm300 = true;
             break;
         case ROM_SET_JV880:
-            mcu_jv880 = true;
-            rom2_mask /= 2; // rom is half the size
-            lcd_width = 820;
-            lcd_height = 100;
-            lcd_col1 = 0x000000;
-            lcd_col2 = 0x78b500;
+            st->mcu_jv880 = true;
+            st->rom2_mask /= 2; // rom is half the size
+            st->lcd_width = 820;
+            st->lcd_height = 100;
+            st->lcd_col1 = 0x000000;
+            st->lcd_col2 = 0x78b500;
             break;
         case ROM_SET_SCB55:
         case ROM_SET_RLP3237:
-            mcu_scb55 = true;
+            st->mcu_scb55 = true;
             break;
     }
 
-    std::string rpaths[ROM_SET_N_FILES];
-
-    bool r_ok = true;
-    std::string errors_list;
-
-    for(size_t i = 0; i < ROM_SET_N_FILES; ++i)
+    if (LCD_SetBack(st, "back.data", readCallback, readContext) != 0)
     {
-        if (roms[romset][i][0] == '\0')
-        {
-            rpaths[i] = "";
-            continue;
-        }
-        rpaths[i] = basePath + "/" + roms[romset][i];
-        s_rf[i] = Files::utf8_fopen(rpaths[i].c_str(), "rb");
-        bool optional = mcu_jv880 && i >= 4;
-        r_ok &= optional || (s_rf[i] != nullptr);
-        if(!s_rf[i])
-        {
-            if(!errors_list.empty())
-                errors_list.append(", ");
-
-            errors_list.append(rpaths[i]);
-        }
+        free(st);
+        return nullptr;
     }
 
-    if (!r_ok)
-    {
-        fprintf(stderr, "FATAL ERROR: One of required data ROM files is missing: %s.\n", errors_list.c_str());
-        fflush(stderr);
-        closeAllR();
-        return 1;
-    }
+    memset(&st->mcu, 0, sizeof(mcu_t));
 
-    LCD_SetBackPath(basePath + "/back.data");
-
-    memset(&mcu, 0, sizeof(mcu_t));
-
-
-    if (fread(rom1, 1, ROM1_SIZE, s_rf[0]) != ROM1_SIZE)
+    uint32_t size = ROM1_SIZE;
+    if (readCallback(readContext, roms[st->romset][0], st->rom1, &size) < 0 || size != ROM1_SIZE)
     {
         fprintf(stderr, "FATAL ERROR: Failed to read the mcu ROM1.\n");
         fflush(stderr);
-        closeAllR();
-        return 1;
+        free(st);
+        return nullptr;
     }
 
-    size_t rom2_read = fread(rom2, 1, ROM2_SIZE, s_rf[1]);
+    uint32_t rom2_read = ROM2_SIZE;
+    int readErr = readCallback(readContext, roms[st->romset][1], st->rom2, &rom2_read);
 
-    if (rom2_read == ROM2_SIZE || rom2_read == ROM2_SIZE / 2)
+    if (!readErr && (rom2_read == ROM2_SIZE || rom2_read == ROM2_SIZE / 2))
     {
-        rom2_mask = rom2_read - 1;
+        st->rom2_mask = rom2_read - 1;
     }
     else
     {
         fprintf(stderr, "FATAL ERROR: Failed to read the mcu ROM2.\n");
         fflush(stderr);
-        closeAllR();
-        return 1;
+        free(st);
+        return nullptr;
     }
 
-    if (mcu_mk1)
+    uint8_t *tempbuf = nullptr;
+
+    tempbuf = (uint8_t *) malloc(0x800000);
+    if (!tempbuf) {
+        free(st);
+        return nullptr;
+    }
+
+    if (st->mcu_mk1)
     {
-        if (fread(tempbuf, 1, 0x100000, s_rf[2]) != 0x100000)
+        size = 0x100000;
+        if (readCallback(readContext, roms[st->romset][2], tempbuf, &size) < 0 || size != 0x100000)
         {
             fprintf(stderr, "FATAL ERROR: Failed to read the WaveRom1.\n");
             fflush(stderr);
-            closeAllR();
-            return 1;
+            free(tempbuf);
+            free(st);
+            return nullptr;
         }
 
-        unscramble(tempbuf, waverom1, 0x100000);
+        unscramble(tempbuf, st->waverom1, 0x100000);
 
-        if (fread(tempbuf, 1, 0x100000, s_rf[3]) != 0x100000)
+        if (readCallback(readContext, roms[st->romset][3], tempbuf, &size) < 0 || size != 0x100000)
         {
             fprintf(stderr, "FATAL ERROR: Failed to read the WaveRom2.\n");
             fflush(stderr);
-            closeAllR();
-            return 1;
+            free(tempbuf);
+            free(st);
+            return nullptr;
         }
 
-        unscramble(tempbuf, waverom2, 0x100000);
+        unscramble(tempbuf, st->waverom2, 0x100000);
 
-        if (fread(tempbuf, 1, 0x100000, s_rf[4]) != 0x100000)
+        if (readCallback(readContext, roms[st->romset][4], tempbuf, &size) < 0 || size != 0x100000)
         {
             fprintf(stderr, "FATAL ERROR: Failed to read the WaveRom3.\n");
             fflush(stderr);
-            closeAllR();
-            return 1;
+            free(tempbuf);
+            free(st);
+            return nullptr;
         }
 
-        unscramble(tempbuf, waverom3, 0x100000);
+        unscramble(tempbuf, st->waverom3, 0x100000);
     }
-    else if (mcu_jv880)
+    else if (st->mcu_jv880)
     {
-        if (fread(tempbuf, 1, 0x200000, s_rf[2]) != 0x200000)
+        size = 0x200000;
+        if (readCallback(readContext, roms[st->romset][2], tempbuf, &size) < 0 || size != 0x200000)
         {
             fprintf(stderr, "FATAL ERROR: Failed to read the WaveRom1.\n");
             fflush(stderr);
-            closeAllR();
-            return 1;
+            free(tempbuf);
+            free(st);
+            return nullptr;
         }
 
-        unscramble(tempbuf, waverom1, 0x200000);
+        unscramble(tempbuf, st->waverom1, 0x200000);
 
-        if (fread(tempbuf, 1, 0x200000, s_rf[3]) != 0x200000)
+        if (readCallback(readContext, roms[st->romset][3], tempbuf, &size) < 0 || size != 0x200000)
         {
             fprintf(stderr, "FATAL ERROR: Failed to read the WaveRom2.\n");
             fflush(stderr);
-            closeAllR();
-            return 1;
+            free(tempbuf);
+            free(st);
+            return nullptr;
         }
 
-        unscramble(tempbuf, waverom2, 0x200000);
+        unscramble(tempbuf, st->waverom2, 0x200000);
         
-        if (s_rf[4] && fread(tempbuf, 1, 0x800000, s_rf[4]))
-            unscramble(tempbuf, waverom_exp, 0x800000);
+        size = 0x800000;
+        if (readCallback(readContext, roms[st->romset][4], tempbuf, &size) == 0)
+            unscramble(tempbuf, st->waverom_exp, 0x800000);
         else
             printf("WaveRom EXP not found, skipping it.\n");
         
-        if (s_rf[5] && fread(tempbuf, 1, 0x200000, s_rf[5]))
-            unscramble(tempbuf, waverom_card, 0x200000);
+        size = 0x200000;
+        if (readCallback(readContext, roms[st->romset][5], tempbuf, &size) == 0)
+            unscramble(tempbuf, st->waverom_card, 0x200000);
         else
             printf("WaveRom PCM not found, skipping it.\n");
     }
     else
     {
-        if (fread(tempbuf, 1, 0x200000, s_rf[2]) != 0x200000)
+        size = 0x200000;
+        if (readCallback(readContext, roms[st->romset][2], tempbuf, &size) < 0 || size != 0x200000)
         {
             fprintf(stderr, "FATAL ERROR: Failed to read the WaveRom1.\n");
             fflush(stderr);
-            closeAllR();
-            return 1;
+            free(tempbuf);
+            free(st);
+            return nullptr;
         }
 
-        unscramble(tempbuf, waverom1, 0x200000);
+        unscramble(tempbuf, st->waverom1, 0x200000);
 
-        if (s_rf[3])
+        if (roms[st->romset][3][0])
         {
-            if (fread(tempbuf, 1, 0x100000, s_rf[3]) != 0x100000)
+            size = 0x100000;
+            if (readCallback(readContext, roms[st->romset][3], tempbuf, &size) < 0 || size != 0x100000)
             {
                 fprintf(stderr, "FATAL ERROR: Failed to read the WaveRom2.\n");
                 fflush(stderr);
-                closeAllR();
-                return 1;
+                free(tempbuf);
+                free(st);
+                return nullptr;
             }
 
-            unscramble(tempbuf, mcu_scb55 ? waverom3 : waverom2, 0x100000);
+            unscramble(tempbuf, st->mcu_scb55 ? st->waverom3 : st->waverom2, 0x100000);
         }
 
-        if (s_rf[4] && fread(sm_rom, 1, ROMSM_SIZE, s_rf[4]) != ROMSM_SIZE)
+        if (roms[st->romset][4][0])
         {
-            fprintf(stderr, "FATAL ERROR: Failed to read the sub mcu ROM.\n");
-            fflush(stderr);
-            closeAllR();
-            return 1;
+            size = ROMSM_SIZE;
+            if (readCallback(readContext, roms[st->romset][4], st->sm_rom, &size) < 0 || size != ROMSM_SIZE)
+            {
+                fprintf(stderr, "FATAL ERROR: Failed to read the sub mcu ROM.\n");
+                fflush(stderr);
+                free(tempbuf);
+                free(st);
+                return nullptr;
+            }
         }
     }
 
-    // Close all files as they no longer needed being open
-    closeAllR();
+    free(tempbuf);
+    tempbuf = nullptr;
 
-    if (SDL_Init(SDL_INIT_AUDIO | SDL_INIT_VIDEO | SDL_INIT_TIMER) < 0)
-    {
-        fprintf(stderr, "FATAL ERROR: Failed to initialize the SDL2: %s.\n", SDL_GetError());
-        fflush(stderr);
-        return 2;
-    }
-
-    if (!MCU_OpenAudio(audioDeviceIndex, pageSize, pageNum))
+    if (!MCU_OpenAudio(st, pageSize, pageNum))
     {
         fprintf(stderr, "FATAL ERROR: Failed to open the audio stream.\n");
         fflush(stderr);
-        return 2;
+        free(st);
+        return nullptr;
     }
 
-    if(!MIDI_Init(port))
+    LCD_Init(st);
+    MCU_Init(st);
+    MCU_PatchROM(st);
+    MCU_Reset(st);
+    SM_Reset(st);
+    PCM_Reset(st);
+
+    if (resetType != ResetType::NONE) MIDI_Reset(st, resetType);
+
+    return st;
+}
+
+void sc55_free(struct sc55_state *st)
+{
+    MCU_CloseAudio(st);
+    LCD_UnInit(st);
+
+    free(st);
+}
+
+static void sc55_read_samples(struct sc55_state *st, short *buffer, uint32_t count)
+{
+    while(count && st->sample_buffer_count)
     {
-        fprintf(stderr, "ERROR: Failed to initialize the MIDI Input.\nWARNING: Continuing without MIDI Input...\n");
-        fflush(stderr);
+        size_t countToDo = (st->audio_buffer_size - st->sample_read_ptr) / 2;
+        if (countToDo > st->sample_buffer_count)
+            countToDo = st->sample_buffer_count;
+        if (countToDo > count)
+            countToDo = count;
+        memcpy(buffer, &st->sample_buffer[st->sample_read_ptr], countToDo * sizeof(short) * 2);
+		buffer += countToDo * 2;
+        st->sample_read_ptr = (st->sample_read_ptr + countToDo * 2) % st->audio_buffer_size;
+        st->sample_buffer_count -= countToDo;
     }
+}
 
-    LCD_Init();
-    MCU_Init();
-    MCU_PatchROM();
-    MCU_Reset();
-    SM_Reset();
-    PCM_Reset();
+void sc55_render(struct sc55_state *st, short *buffer, uint32_t count)
+{
+    uint32_t countDone = 0;
 
-    if (resetType != ResetType::NONE) MIDI_Reset(resetType);
-    
-    MCU_Run();
+    while (countDone < count)
+    {
+        uint32_t countToDo = count - countDone;
 
-    MCU_CloseAudio();
-    MIDI_Quit();
-    LCD_UnInit();
-    SDL_Quit();
+        if (st->sample_buffer_count)
+        {
+            if (st->sample_buffer_count >= countToDo)
+            {
+                sc55_read_samples(st, buffer, count);
+                return;
+            }
+            else
+            {
+                uint32_t savedCount = st->sample_buffer_count;
+                sc55_read_samples(st, buffer, savedCount);
+                buffer += savedCount * 2;
+                countDone += savedCount;
+            }
+        }
 
-    return 0;
+        countToDo = count - countDone;
+        if (countToDo)
+        {
+            if (countToDo > st->audio_page_size)
+                countToDo = st->audio_page_size;
+            st->sample_buffer_requested = countToDo;
+            MCU_Work(st);
+        }
+    }
+}
+
+void sc55_write_uart(struct sc55_state *st, const uint8_t *data, uint32_t count)
+{
+	for (uint32_t i = 0; i < count; ++i)
+	{
+		MCU_PostUART(st, data[i]);
+	}
+}
+
+uint32_t sc55_get_sample_rate(struct sc55_state *st)
+{
+	return st->sample_rate;
+}
+
+void sc55_spin(struct sc55_state *st, uint32_t count)
+{
+	while(count > 0)
+	{
+		uint32_t countToDo = st->audio_page_size;
+		if(countToDo > count)
+			countToDo = count;
+		st->sample_buffer_requested = countToDo;
+		MCU_Work(st);
+		st->sample_buffer_count = 0;
+		count -= countToDo;
+	}
 }
