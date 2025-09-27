@@ -1441,7 +1441,7 @@ static void sc55_read_samples(struct sc55_state *st, short *buffer, uint32_t cou
         if (countToDo > count)
             countToDo = count;
         memcpy(buffer, &st->sample_buffer[st->sample_read_ptr], countToDo * sizeof(short) * 2);
-		buffer += countToDo * 2;
+        buffer += countToDo * 2;
         st->sample_read_ptr = (st->sample_read_ptr + countToDo * 2) % st->audio_buffer_size;
         st->sample_buffer_count -= countToDo;
     }
@@ -1484,27 +1484,26 @@ void sc55_render(struct sc55_state *st, short *buffer, uint32_t count)
 
 void sc55_write_uart(struct sc55_state *st, const uint8_t *data, uint32_t count)
 {
-	for (uint32_t i = 0; i < count; ++i)
-	{
-		MCU_PostUART(st, data[i]);
-	}
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        MCU_PostUART(st, data[i]);
+    }
 }
 
 uint32_t sc55_get_sample_rate(struct sc55_state *st)
 {
-	return st->sample_rate;
+    return st->sample_rate;
 }
 
 void sc55_spin(struct sc55_state *st, uint32_t count)
 {
-	while(count > 0)
-	{
-		uint32_t countToDo = st->audio_page_size;
-		if(countToDo > count)
-			countToDo = count;
-		st->sample_buffer_requested = countToDo;
-		MCU_Work(st);
-		st->sample_buffer_count = 0;
-		count -= countToDo;
-	}
+    while(count > 0)
+    {
+        uint32_t countToDo = st->audio_page_size;
+        if(countToDo > count)
+            countToDo = count;
+        st->sample_buffer_requested = countToDo;
+        MCU_Work(st);
+        count -= countToDo;
+    }
 }
